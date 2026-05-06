@@ -12,6 +12,7 @@ const { AsyncLocalStorage } = require('async_hooks');
 // const bodyParser = require('body-parser'); 
 
 const app = express();
+app.set('trust proxy', true);
 
 // AsyncLocalStorage for per-request context isolation
 // This ensures cookies don't leak between concurrent requests
@@ -27,6 +28,12 @@ function getRequestConfig() {
 function getRequestBaseUrl() {
     const store = requestContext.getStore();
     return store?.baseUrl || '';
+}
+
+function resolveRequestBaseUrl(req) {
+    const forwardedProto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim();
+    const protocol = forwardedProto || req.protocol || 'http';
+    return `${protocol}://${req.get('host')}`;
 }
 
 function signPlaybackPayload(payload) {
@@ -188,7 +195,7 @@ app.get('/api/playback', async (req, res) => {
 
         if (looksLikeHlsManifest(contentType, bodyBuffer.toString('utf8'))) {
             const manifestText = bodyBuffer.toString('utf8');
-            const baseUrl = `${req.protocol}://${req.get('host')}`;
+            const baseUrl = resolveRequestBaseUrl(req);
             const finalManifestUrl = response.request?.res?.responseUrl || upstreamUrl;
             const rewritten = manifestText
                 .split(/\r?\n/)
@@ -372,7 +379,7 @@ app.use((req, res, next) => {
     // This ensures each request has its own isolated config that won't leak to other requests
     requestContext.run({
         config: requestConfig,
-        baseUrl: `${req.protocol}://${req.get('host')}`,
+        baseUrl: resolveRequestBaseUrl(req),
     }, () => {
         // Also set on req for direct access in middleware
         req.nuvioConfig = requestConfig;
