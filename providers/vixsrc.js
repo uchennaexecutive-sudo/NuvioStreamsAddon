@@ -149,123 +149,201 @@ function resolveUrl(url, baseUrl) {
     }
 }
 
-// Helper function to extract stream URL from Vixsrc page
-function extractStreamFromPage(url, contentType, contentId, seasonNum, episodeNum) {
-    let vixsrcUrl;
-    let subtitleApiUrl;
-
-    if (contentType === 'movie') {
-        vixsrcUrl = `${BASE_URL}/movie/${contentId}`;
-        subtitleApiUrl = `https://sub.wyzie.ru/search?id=${contentId}`;
-    } else {
-        vixsrcUrl = `${BASE_URL}/tv/${contentId}/${seasonNum}/${episodeNum}`;
-        subtitleApiUrl = `https://sub.wyzie.ru/search?id=${contentId}&season=${seasonNum}&episode=${episodeNum}`;
+function extractPlaylistAttribute(line, attribute) {
+    const quotedMatch = line.match(new RegExp(`${attribute}="([^"]+)"`));
+    if (quotedMatch) {
+        return quotedMatch[1];
     }
 
-    console.log(`[Vixsrc] Fetching: ${vixsrcUrl}`);
+    const unquotedMatch = line.match(new RegExp(`${attribute}=([^,]+)`));
+    return unquotedMatch ? unquotedMatch[1] : null;
+}
 
-    return makeRequest(vixsrcUrl, {
+function normalizeSubtitleLanguage(language, label) {
+    const normalized = String(language || label || 'en').toLowerCase();
+    const primary = normalized.split('-')[0];
+    const map = {
+        eng: 'en',
+        en: 'en',
+        ger: 'de',
+        deu: 'de',
+        de: 'de',
+        fre: 'fr',
+        fra: 'fr',
+        fr: 'fr',
+        ita: 'it',
+        it: 'it',
+        jpn: 'ja',
+        ja: 'ja',
+        ukr: 'uk',
+        uk: 'uk',
+        por: 'pt',
+        pt: 'pt',
+        spa: 'es',
+        es: 'es',
+    };
+
+    return map[primary] || primary || 'en';
+}
+
+function getSubtitlesFromManifest(masterPlaylistUrl) {
+    return makeRequest(masterPlaylistUrl, {
         headers: {
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+            'Accept': 'application/vnd.apple.mpegurl, application/x-mpegURL, */*',
+            'Referer': BASE_URL,
         }
     })
     .then(response => response.text())
-    .then(html => {
-        console.log(`[Vixsrc] HTML length: ${html.length} characters`);
+    .then(manifest => {
+        const lines = manifest.split('\n').map(line => line.trim()).filter(Boolean);
+        const subtitles = [];
+        const seen = new Set();
 
-        let masterPlaylistUrl = null;
-
-        // Method 1: Look for window.masterPlaylist (primary method)
-        if (html.includes('window.masterPlaylist')) {
-            console.log('[Vixsrc] Found window.masterPlaylist');
-
-            const urlMatch = html.match(/url:\s*['"]([^'"]+)['"]/);
-            const tokenMatch = html.match(/['"]?token['"]?\s*:\s*['"]([^'"]+)['"]/);
-            const expiresMatch = html.match(/['"]?expires['"]?\s*:\s*['"]([^'"]+)['"]/);
-
-            if (urlMatch && tokenMatch && expiresMatch) {
-                const baseUrl = urlMatch[1];
-                const token = tokenMatch[1];
-                const expires = expiresMatch[1];
-
-                console.log('[Vixsrc] Extracted tokens:');
-                console.log(`  - Base URL: ${baseUrl}`);
-                console.log(`  - Token: ${token.substring(0, 20)}...`);
-                console.log(`  - Expires: ${expires}`);
-
-                // Construct the master playlist URL
-                if (baseUrl.includes('?b=1')) {
-                    masterPlaylistUrl = `${baseUrl}&token=${token}&expires=${expires}&h=1&lang=en`;
-                } else {
-                    masterPlaylistUrl = `${baseUrl}?token=${token}&expires=${expires}&h=1&lang=en`;
-                }
-
-                console.log(`[Vixsrc] Constructed master playlist URL: ${masterPlaylistUrl}`);
+        for (const line of lines) {
+            if (!line.startsWith('#EXT-X-MEDIA:')) {
+                continue;
             }
-        }
 
-        // Method 2: Look for direct .m3u8 URLs
-        if (!masterPlaylistUrl) {
-            const m3u8Match = html.match(/(https?:\/\/[^'"\s]+\.m3u8[^'"\s]*)/);
-            if (m3u8Match) {
-                masterPlaylistUrl = m3u8Match[1];
-                console.log('[Vixsrc] Found direct .m3u8 URL:', masterPlaylistUrl);
+            const type = extractPlaylistAttribute(line, 'TYPE');
+            if (type !== 'SUBTITLES') {
+                continue;
             }
-        }
 
-        // Method 3: Look for stream URLs in script tags
-        if (!masterPlaylistUrl) {
-            const scriptMatches = html.match(/<script[^>]*>(.*?)<\/script>/gs);
-            if (scriptMatches) {
-                for (const script of scriptMatches) {
-                    const streamMatch = script.match(/['"]?(https?:\/\/[^'"\s]+(?:\.m3u8|playlist)[^'"\s]*)/);
-                    if (streamMatch) {
-                        masterPlaylistUrl = streamMatch[1];
-                        console.log('[Vixsrc] Found stream in script:', masterPlaylistUrl);
-                        break;
-                    }
-                }
+            const uri = extractPlaylistAttribute(line, 'URI');
+            if (!uri) {
+                continue;
             }
+
+            const label = extractPlaylistAttribute(line, 'NAME') || 'Unknown';
+            const language = normalizeSubtitleLanguage(extractPlaylistAttribute(line, 'LANGUAGE'), label);
+            const isHearingImpaired = /\[cc\]/i.test(label);
+            const resolvedUrl = resolveUrl(uri, masterPlaylistUrl);
+
+            if (seen.has(resolvedUrl)) {
+                continue;
+            }
+            seen.add(resolvedUrl);
+
+            subtitles.push({
+                url: resolvedUrl,
+                label,
+                language,
+                format: 'vtt',
+                source: 'vixsrc',
+                isHearingImpaired,
+            });
         }
 
-        if (!masterPlaylistUrl) {
-            console.log('[Vixsrc] No master playlist URL found');
-            return null;
-        }
-
-        return { masterPlaylistUrl, subtitleApiUrl };
-    });
-}
-
-// Helper function to get subtitles
-function getSubtitles(subtitleApiUrl) {
-    return makeRequest(subtitleApiUrl)
-    .then(response => response.json())
-    .then(subtitleData => {
-        // Find English subtitle track (same logic as original)
-        let subtitleTrack = subtitleData.find(track =>
-            track.display.includes('English') && (track.encoding === 'ASCII' || track.encoding === 'UTF-8')
-        );
-
-        if (!subtitleTrack) {
-            subtitleTrack = subtitleData.find(track => track.display.includes('English') && track.encoding === 'CP1252');
-        }
-
-        if (!subtitleTrack) {
-            subtitleTrack = subtitleData.find(track => track.display.includes('English') && track.encoding === 'CP1250');
-        }
-
-        if (!subtitleTrack) {
-            subtitleTrack = subtitleData.find(track => track.display.includes('English') && track.encoding === 'CP850');
-        }
-
-        const subtitles = subtitleTrack ? subtitleTrack.url : '';
-        console.log(subtitles ? `[Vixsrc] Found subtitles: ${subtitles}` : '[Vixsrc] No English subtitles found');
+        console.log(`[Vixsrc] Found ${subtitles.length} native subtitle tracks in master playlist`);
         return subtitles;
     })
     .catch(error => {
-        console.log('[Vixsrc] Subtitle fetch failed:', error.message);
-        return '';
+        console.log('[Vixsrc] Native subtitle manifest fetch failed:', error.message);
+        return [];
+    });
+}
+
+// Helper function to extract stream URL from Vixsrc page
+// Step 1: call /api/tv/{id}/{s}/{e} or /api/movie/{id} to get embed src
+// Step 2: fetch the embed page which contains window.masterPlaylist
+function extractStreamFromPage(url, contentType, contentId, seasonNum, episodeNum) {
+    const apiUrl = contentType === 'movie'
+        ? `${BASE_URL}/api/movie/${contentId}`
+        : `${BASE_URL}/api/tv/${contentId}/${seasonNum}/${episodeNum}`;
+
+    console.log(`[Vixsrc] Fetching API: ${apiUrl}`);
+
+    return makeRequest(apiUrl, {
+        headers: {
+            'Accept': 'application/json',
+            'Referer': BASE_URL,
+        }
+    })
+    .then(response => response.json())
+    .then(data => {
+        if (!data?.src) {
+            console.log('[Vixsrc] API returned no src');
+            return null;
+        }
+
+        const embedUrl = `${BASE_URL}${data.src}`;
+        console.log(`[Vixsrc] Fetching embed: ${embedUrl}`);
+
+        return makeRequest(embedUrl, {
+            headers: {
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Referer': BASE_URL,
+            }
+        })
+        .then(response => response.text())
+        .then(html => {
+            console.log(`[Vixsrc] Embed HTML length: ${html.length} characters`);
+
+            let masterPlaylistUrl = null;
+
+            // Method 1: Look for window.masterPlaylist (primary method)
+            if (html.includes('window.masterPlaylist')) {
+                console.log('[Vixsrc] Found window.masterPlaylist');
+
+                const urlMatch = html.match(/url:\s*['"]([^'"]+)['"]/);
+                const tokenMatch = html.match(/['"]?token['"]?\s*:\s*['"]([^'"]+)['"]/);
+                const expiresMatch = html.match(/['"]?expires['"]?\s*:\s*['"]([^'"]+)['"]/);
+
+                if (urlMatch && tokenMatch && expiresMatch) {
+                    const baseUrl = urlMatch[1];
+                    const token = tokenMatch[1];
+                    const expires = expiresMatch[1];
+
+                    console.log('[Vixsrc] Extracted tokens:');
+                    console.log(`  - Base URL: ${baseUrl}`);
+                    console.log(`  - Token: ${token.substring(0, 20)}...`);
+                    console.log(`  - Expires: ${expires}`);
+
+                    if (baseUrl.includes('?b=1')) {
+                        masterPlaylistUrl = `${baseUrl}&token=${token}&expires=${expires}&h=1&lang=en`;
+                    } else {
+                        masterPlaylistUrl = `${baseUrl}?token=${token}&expires=${expires}&h=1&lang=en`;
+                    }
+
+                    console.log(`[Vixsrc] Constructed master playlist URL: ${masterPlaylistUrl}`);
+                }
+            }
+
+            // Method 2: Look for direct .m3u8 URLs
+            if (!masterPlaylistUrl) {
+                const m3u8Match = html.match(/(https?:\/\/[^'"\s]+\.m3u8[^'"\s]*)/);
+                if (m3u8Match) {
+                    masterPlaylistUrl = m3u8Match[1];
+                    console.log('[Vixsrc] Found direct .m3u8 URL:', masterPlaylistUrl);
+                }
+            }
+
+            // Method 3: Look for stream URLs in script tags
+            if (!masterPlaylistUrl) {
+                const scriptMatches = html.match(/<script[^>]*>(.*?)<\/script>/gs);
+                if (scriptMatches) {
+                    for (const script of scriptMatches) {
+                        const streamMatch = script.match(/['"]?(https?:\/\/[^'"\s]+(?:\.m3u8|playlist)[^'"\s]*)/);
+                        if (streamMatch) {
+                            masterPlaylistUrl = streamMatch[1];
+                            console.log('[Vixsrc] Found stream in script:', masterPlaylistUrl);
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (!masterPlaylistUrl) {
+                console.log('[Vixsrc] No master playlist URL found in embed page');
+                return null;
+            }
+
+            return { masterPlaylistUrl };
+        });
+    })
+    .catch(error => {
+        console.error(`[Vixsrc] extractStreamFromPage failed: ${error.message}`);
+        return null;
     });
 }
 
@@ -286,13 +364,13 @@ function getVixsrcStreams(tmdbId, mediaType = 'movie', seasonNum = null, episode
             return [];
         }
 
-        const { masterPlaylistUrl, subtitleApiUrl } = streamData;
+        const { masterPlaylistUrl } = streamData;
 
         // Return single master playlist with Auto quality
         console.log('[Vixsrc] Returning master playlist with Auto quality...');
         
-        // Get subtitles
-        return getSubtitles(subtitleApiUrl)
+        // Get native subtitles directly from the provider's HLS manifest.
+        return getSubtitlesFromManifest(masterPlaylistUrl)
         .then(subtitles => {
             // Return single stream with master playlist
             const nuvioStreams = [{
@@ -304,7 +382,8 @@ function getVixsrcStreams(tmdbId, mediaType = 'movie', seasonNum = null, episode
                 headers: {
                     'Referer': BASE_URL,
                     'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
-                }
+                },
+                subtitles
             }];
 
             console.log('[Vixsrc] Successfully processed 1 stream with Auto quality');

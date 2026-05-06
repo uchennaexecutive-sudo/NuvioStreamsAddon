@@ -185,7 +185,10 @@ if (USE_EXTERNAL_PROVIDERS) {
 // NEW: Stream caching config
 const STREAM_CACHE_DIR = process.env.VERCEL ? path.join('/tmp', '.streams_cache') : path.join(__dirname, '.streams_cache');
 const STREAM_CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
+// Bump cache version so older Vixsrc responses without native subtitles are discarded.
+const STREAM_CACHE_VERSION = 'v3';
 const ENABLE_STREAM_CACHE = process.env.DISABLE_STREAM_CACHE !== 'true'; // Enabled by default
+const UNCACHED_STREAM_PROVIDERS = new Set(['showbox', 'pstream', 'moviesmod', '4khdhub']);
 console.log(`[addon.js] Stream links caching ${ENABLE_STREAM_CACHE ? 'enabled' : 'disabled'}`);
 console.log(`[addon.js] Redis caching ${redis ? 'available' : 'not available'}`);
 
@@ -598,7 +601,7 @@ ensureStreamCacheDir().catch(err => console.error(`[Stream Cache] Error creating
 // Generate cache key for a provider's streams
 const getStreamCacheKey = (provider, type, id, seasonNum = null, episodeNum = null, region = null, cookie = null) => {
     // Basic key parts
-    let key = `streams_${provider}_${type}_${id}`;
+    let key = `streams_${STREAM_CACHE_VERSION}_${provider}_${type}_${id}`;
 
     // Add season/episode for TV series
     if (seasonNum !== null && episodeNum !== null) {
@@ -622,9 +625,9 @@ const getStreamCacheKey = (provider, type, id, seasonNum = null, episodeNum = nu
 // Get cached streams for a provider - Hybrid approach (Redis first, then file)
 const getStreamFromCache = async (provider, type, id, seasonNum = null, episodeNum = null, region = null, cookie = null) => {
     if (!ENABLE_STREAM_CACHE) return null;
-    // Exclude ShowBox and PStream from cache entirely
+    // Exclude volatile providers from cache entirely
     try {
-        if (provider && ['showbox', 'pstream'].includes(String(provider).toLowerCase())) {
+        if (provider && UNCACHED_STREAM_PROVIDERS.has(String(provider).toLowerCase())) {
             return null;
         }
     } catch (_) { }
@@ -695,9 +698,9 @@ const getStreamFromCache = async (provider, type, id, seasonNum = null, episodeN
 // Save streams to cache - Hybrid approach (Redis + file)
 const saveStreamToCache = async (provider, type, id, streams, status = 'ok', seasonNum = null, episodeNum = null, region = null, cookie = null, ttlMs = null) => {
     if (!ENABLE_STREAM_CACHE) return;
-    // Exclude ShowBox and PStream from cache entirely
+    // Exclude volatile providers from cache entirely
     try {
-        if (provider && ['showbox', 'pstream'].includes(String(provider).toLowerCase())) {
+        if (provider && UNCACHED_STREAM_PROVIDERS.has(String(provider).toLowerCase())) {
             return;
         }
     } catch (_) { }
@@ -1792,7 +1795,7 @@ builder.defineStreamHandler(async (args) => {
 
         // Combine streams in the preferred provider order
         combinedRawStreams = [];
-        const providerOrder = ['ShowBox', 'MovieBox', 'UHDMovies', '4KHDHub', 'HDHub4u', 'MoviesMod', 'TopMovies', 'MoviesDrive', 'Soaper TV', 'VidZee', 'MP4Hydra', 'VidSrc', 'Vixsrc'];
+        const providerOrder = ['Vixsrc', '4KHDHub', 'HDHub4u', 'MoviesMod', 'TopMovies', 'MoviesDrive', 'Soaper TV', 'VidZee', 'MP4Hydra', 'UHDMovies', 'ShowBox', 'MovieBox', 'VidSrc'];
         providerOrder.forEach(providerKey => {
             if (streamsByProvider[providerKey] && streamsByProvider[providerKey].length > 0) {
                 combinedRawStreams.push(...streamsByProvider[providerKey]);
@@ -1823,6 +1826,7 @@ builder.defineStreamHandler(async (args) => {
                 url: stream.url,
                 type: 'url',
                 availability: 2,
+                subtitles: stream.subtitles || [],
                 behaviorHints: {
                     notWebReady: true
                 }
@@ -1837,6 +1841,7 @@ builder.defineStreamHandler(async (args) => {
                 url: stream.url,
                 type: 'url',
                 availability: 2,
+                subtitles: stream.subtitles || [],
                 behaviorHints: {
                     notWebReady: true
                 }
@@ -1851,6 +1856,7 @@ builder.defineStreamHandler(async (args) => {
                 url: stream.url,
                 type: 'url',
                 availability: 2,
+                subtitles: stream.subtitles || [],
                 behaviorHints: {
                     notWebReady: true
                 }
@@ -2132,6 +2138,7 @@ ${warningMessage}`;
             url: stream.url,
             type: 'url', // CRITICAL: This is the type of the stream itself, not the content
             availability: 2,
+            subtitles: stream.subtitles || [],
             behaviorHints: behaviorHints
         };
     });
