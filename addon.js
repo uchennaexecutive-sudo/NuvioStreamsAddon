@@ -1816,6 +1816,31 @@ builder.defineStreamHandler(async (args) => {
 
     console.log(`Total streams after provider-level sorting: ${combinedRawStreams.length}`);
 
+    const buildBehaviorHints = (stream) => {
+        const existing = stream && stream.behaviorHints && typeof stream.behaviorHints === 'object'
+            ? { ...stream.behaviorHints }
+            : {};
+        const rawHeaders = stream && stream.headers && typeof stream.headers === 'object'
+            ? stream.headers
+            : null;
+
+        if (rawHeaders && Object.keys(rawHeaders).length > 0) {
+            const existingHeaders = existing.headers && typeof existing.headers === 'object'
+                ? existing.headers
+                : {};
+            existing.headers = {
+                ...existingHeaders,
+                ...rawHeaders
+            };
+        }
+
+        if (typeof existing.notWebReady !== 'boolean') {
+            existing.notWebReady = true;
+        }
+
+        return existing;
+    };
+
     // Format and send the response
     const stremioStreamObjects = combinedRawStreams.map((stream) => {
         // --- Special handling for MoviesMod which has pre-formatted titles ---
@@ -1827,9 +1852,7 @@ builder.defineStreamHandler(async (args) => {
                 type: 'url',
                 availability: 2,
                 subtitles: stream.subtitles || [],
-                behaviorHints: {
-                    notWebReady: true
-                }
+                behaviorHints: buildBehaviorHints(stream)
             };
         }
 
@@ -1842,9 +1865,7 @@ builder.defineStreamHandler(async (args) => {
                 type: 'url',
                 availability: 2,
                 subtitles: stream.subtitles || [],
-                behaviorHints: {
-                    notWebReady: true
-                }
+                behaviorHints: buildBehaviorHints(stream)
             };
         }
 
@@ -1857,9 +1878,7 @@ builder.defineStreamHandler(async (args) => {
                 type: 'url',
                 availability: 2,
                 subtitles: stream.subtitles || [],
-                behaviorHints: {
-                    notWebReady: true
-                }
+                behaviorHints: buildBehaviorHints(stream)
             };
         }
 
@@ -2129,8 +2148,7 @@ ${titleSecondLine}` : displayTitle;
 ${warningMessage}`;
         }
 
-        // Use provider's behaviorHints if available, otherwise default to notWebReady: true
-        const behaviorHints = stream.behaviorHints || { notWebReady: true };
+        const behaviorHints = buildBehaviorHints(stream);
 
         return {
             name: nameDisplay,
