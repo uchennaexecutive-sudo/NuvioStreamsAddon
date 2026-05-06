@@ -16,6 +16,7 @@ const app = express();
 // AsyncLocalStorage for per-request context isolation
 // This ensures cookies don't leak between concurrent requests
 const requestContext = new AsyncLocalStorage();
+const PLAYBACK_PROXY_SECRET = process.env.PLAYBACK_PROXY_SECRET || process.env.TMDB_API_KEY || 'nuvio-playback-proxy';
 
 // Helper to get current request config (safe for concurrent requests)
 function getRequestConfig() {
@@ -23,8 +24,114 @@ function getRequestConfig() {
     return store?.config || {};
 }
 
+function getRequestBaseUrl() {
+    const store = requestContext.getStore();
+    return store?.baseUrl || '';
+}
+
+function signPlaybackPayload(payload) {
+    const encoded = Buffer.from(JSON.stringify(payload)).toString('base64url');
+    const sig = crypto
+        .createHmac('sha256', PLAYBACK_PROXY_SECRET)
+        .update(encoded)
+        .digest('base64url');
+    return { payload: encoded, sig };
+}
+
+function verifyPlaybackPayload(payload, sig) {
+    if (!payload || !sig) return null;
+
+    const expectedSig = crypto
+        .createHmac('sha256', PLAYBACK_PROXY_SECRET)
+        .update(payload)
+        .digest('base64url');
+
+    const left = Buffer.from(sig);
+    const right = Buffer.from(expectedSig);
+    if (left.length !== right.length || !crypto.timingSafeEqual(left, right)) {
+        return null;
+    }
+
+    try {
+        const raw = Buffer.from(payload, 'base64url').toString('utf8');
+        const decoded = JSON.parse(raw);
+        if (!decoded || typeof decoded !== 'object') return null;
+        if (!decoded.url || typeof decoded.url !== 'string') return null;
+        return decoded;
+    } catch (error) {
+        console.error('[playback-proxy] Failed to decode payload:', error.message);
+        return null;
+    }
+}
+
+function absolutizePlaybackReference(reference, baseUrl) {
+    try {
+        return new URL(reference, baseUrl).toString();
+    } catch {
+        return reference;
+    }
+}
+
+function buildPlaybackProxyUrl(baseUrl, targetUrl, headers = {}) {
+    const { payload, sig } = signPlaybackPayload({
+        url: targetUrl,
+        headers,
+    });
+    return `${baseUrl}/api/playback?payload=${encodeURIComponent(payload)}&sig=${encodeURIComponent(sig)}`;
+}
+
+function rewritePlaybackUriAttributes(line, manifestUrl, baseUrl, headers = {}) {
+    let output = '';
+    let remaining = line;
+
+    while (true) {
+        const start = remaining.indexOf('URI="');
+        if (start === -1) break;
+
+        output += remaining.slice(0, start) + 'URI="';
+        const afterPrefix = remaining.slice(start + 5);
+        const end = afterPrefix.indexOf('"');
+        if (end === -1) {
+            output += afterPrefix;
+            remaining = '';
+            break;
+        }
+
+        const rawUri = afterPrefix.slice(0, end);
+        const absolute = absolutizePlaybackReference(rawUri, manifestUrl);
+        output += buildPlaybackProxyUrl(baseUrl, absolute, headers) + '"';
+        remaining = afterPrefix.slice(end + 1);
+    }
+
+    return output + remaining;
+}
+
+function rewritePlaybackManifestLine(line, manifestUrl, baseUrl, headers = {}) {
+    const trimmed = String(line || '').trim();
+    if (!trimmed) return line;
+
+    if (trimmed.startsWith('#')) {
+        return rewritePlaybackUriAttributes(line, manifestUrl, baseUrl, headers);
+    }
+
+    const absolute = absolutizePlaybackReference(trimmed, manifestUrl);
+    return buildPlaybackProxyUrl(baseUrl, absolute, headers);
+}
+
+function looksLikeHlsManifest(contentType = '', body = '') {
+    const normalizedType = String(contentType || '').toLowerCase();
+    if (normalizedType.includes('mpegurl') || normalizedType.includes('m3u')) {
+        return true;
+    }
+
+    const trimmed = String(body || '').trimStart();
+    return trimmed.startsWith('#EXTM3U');
+}
+
 // Export for use in addon.js
 global.getRequestConfig = getRequestConfig;
+global.getRequestBaseUrl = getRequestBaseUrl;
+global.signPlaybackPayload = signPlaybackPayload;
 global.requestContext = requestContext;
 
 // REMOVE: User cookies directory and related fs operations
@@ -44,6 +151,65 @@ app.use(express.static(path.join(__dirname, 'views')));
 
 // Serve static files from the 'static' directory (for videos, images, etc.)
 app.use('/static', express.static(path.join(__dirname, 'static')));
+
+app.get('/api/playback', async (req, res) => {
+    const decoded = verifyPlaybackPayload(req.query.payload, req.query.sig);
+    if (!decoded) {
+        return res.status(403).send('Invalid playback token');
+    }
+
+    const upstreamUrl = decoded.url;
+    const upstreamHeaders = decoded.headers && typeof decoded.headers === 'object'
+        ? decoded.headers
+        : {};
+
+    try {
+        const response = await axios.get(upstreamUrl, {
+            responseType: 'arraybuffer',
+            timeout: 30000,
+            maxRedirects: 5,
+            validateStatus: () => true,
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Accept': '*/*',
+                ...upstreamHeaders,
+            },
+        });
+
+        if (response.status < 200 || response.status >= 300) {
+            console.warn(`[playback-proxy] Upstream rejected ${upstreamUrl} with status ${response.status}`);
+            return res.status(response.status).send(Buffer.from(response.data || []));
+        }
+
+        const contentType = response.headers['content-type'] || '';
+        const bodyBuffer = Buffer.isBuffer(response.data)
+            ? response.data
+            : Buffer.from(response.data || []);
+
+        if (looksLikeHlsManifest(contentType, bodyBuffer.toString('utf8'))) {
+            const manifestText = bodyBuffer.toString('utf8');
+            const baseUrl = `${req.protocol}://${req.get('host')}`;
+            const finalManifestUrl = response.request?.res?.responseUrl || upstreamUrl;
+            const rewritten = manifestText
+                .split(/\r?\n/)
+                .map((line) => rewritePlaybackManifestLine(line, finalManifestUrl, baseUrl, upstreamHeaders))
+                .join('\n');
+
+            res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+            res.setHeader('Cache-Control', 'no-store');
+            return res.send(rewritten);
+        }
+
+        if (contentType) {
+            res.setHeader('Content-Type', contentType);
+        }
+        res.setHeader('Cache-Control', 'no-store');
+        return res.send(bodyBuffer);
+    } catch (error) {
+        console.error('[playback-proxy] Request failed:', error.message);
+        return res.status(502).send(`Playback proxy failed: ${error.message}`);
+    }
+});
 
 // Configure route - handles both direct access and path-based parametrized access
 app.get('*configure', (req, res) => {
@@ -204,7 +370,10 @@ app.use((req, res, next) => {
 
     // Run the rest of the request within AsyncLocalStorage context for isolation
     // This ensures each request has its own isolated config that won't leak to other requests
-    requestContext.run({ config: requestConfig }, () => {
+    requestContext.run({
+        config: requestConfig,
+        baseUrl: `${req.protocol}://${req.get('host')}`,
+    }, () => {
         // Also set on req for direct access in middleware
         req.nuvioConfig = requestConfig;
 

@@ -1841,18 +1841,88 @@ builder.defineStreamHandler(async (args) => {
         return existing;
     };
 
+    const isLikelyHlsStream = (stream) => {
+        const url = String(stream?.url || '').toLowerCase();
+        const streamType = String(stream?.streamType || '').toLowerCase();
+        return streamType === 'hls'
+            || url.includes('.m3u8')
+            || url.includes('/playlist/')
+            || url.includes('/manifest')
+            || url.includes('/hls/')
+            || url.includes('format=m3u8');
+    };
+
+    const shouldProxyPlayback = (stream) => {
+        const provider = String(stream?.provider || '').toLowerCase();
+        const hasHeaders = Boolean(stream?.headers && Object.keys(stream.headers).length > 0);
+        return provider.includes('vixsrc')
+            || provider.includes('4khdhub')
+            || hasHeaders
+            || isLikelyHlsStream(stream);
+    };
+
+    const buildPlaybackProxyUrl = (url, headers = {}) => {
+        const baseUrl = typeof global.getRequestBaseUrl === 'function'
+            ? global.getRequestBaseUrl()
+            : '';
+        if (!baseUrl || !url || typeof global.signPlaybackPayload !== 'function') {
+            return '';
+        }
+
+        const signed = global.signPlaybackPayload({ url, headers });
+        return `${baseUrl}/api/playback?payload=${encodeURIComponent(signed.payload)}&sig=${encodeURIComponent(signed.sig)}`;
+    };
+
+    const mapDeliveredSubtitles = (stream, proxiedHeaders = {}) => {
+        const subtitles = Array.isArray(stream?.subtitles) ? stream.subtitles : [];
+        if (!shouldProxyPlayback(stream)) {
+            return subtitles;
+        }
+
+        return subtitles.map((subtitle) => {
+            const url = String(subtitle?.url || '').trim();
+            if (!url) return subtitle;
+            const proxiedUrl = buildPlaybackProxyUrl(url, proxiedHeaders);
+            return proxiedUrl
+                ? { ...subtitle, url: proxiedUrl }
+                : subtitle;
+        });
+    };
+
+    const buildDeliveredStreamAssets = (stream) => {
+        const rawHeaders = stream && stream.headers && typeof stream.headers === 'object'
+            ? stream.headers
+            : {};
+        const shouldProxy = shouldProxyPlayback(stream);
+        const proxiedUrl = shouldProxy ? buildPlaybackProxyUrl(stream.url, rawHeaders) : '';
+        const behaviorHints = buildBehaviorHints(stream);
+
+        if (shouldProxy && proxiedUrl) {
+            delete behaviorHints.headers;
+            behaviorHints.notWebReady = false;
+        }
+
+        return {
+            url: proxiedUrl || stream.url,
+            subtitles: mapDeliveredSubtitles(stream, rawHeaders),
+            behaviorHints,
+        };
+    };
+
     // Format and send the response
     const stremioStreamObjects = combinedRawStreams.map((stream) => {
+        const delivered = buildDeliveredStreamAssets(stream);
+
         // --- Special handling for MoviesMod which has pre-formatted titles ---
         if (stream.provider === 'MoviesMod') {
             return {
                 name: stream.name,    // Use the simple name from provider
                 title: stream.title,  // Use the detailed title from provider
-                url: stream.url,
+                url: delivered.url,
                 type: 'url',
                 availability: 2,
-                subtitles: stream.subtitles || [],
-                behaviorHints: buildBehaviorHints(stream)
+                subtitles: delivered.subtitles,
+                behaviorHints: delivered.behaviorHints
             };
         }
 
@@ -1861,11 +1931,11 @@ builder.defineStreamHandler(async (args) => {
             return {
                 name: stream.name,    // Use the name from the provider, e.g., "TopMovies - 1080p"
                 title: stream.title,  // Use the title from the provider, e.g., "Filename.mkv\nSize"
-                url: stream.url,
+                url: delivered.url,
                 type: 'url',
                 availability: 2,
-                subtitles: stream.subtitles || [],
-                behaviorHints: buildBehaviorHints(stream)
+                subtitles: delivered.subtitles,
+                behaviorHints: delivered.behaviorHints
             };
         }
 
@@ -1874,11 +1944,11 @@ builder.defineStreamHandler(async (args) => {
             return {
                 name: stream.name,    // Use the name from the provider, e.g., "MoviesDrive (Pixeldrain) - 2160p"
                 title: stream.title,  // Use the title from the provider, e.g., "Title\nSize\nFilename"
-                url: stream.url,
+                url: delivered.url,
                 type: 'url',
                 availability: 2,
-                subtitles: stream.subtitles || [],
-                behaviorHints: buildBehaviorHints(stream)
+                subtitles: delivered.subtitles,
+                behaviorHints: delivered.behaviorHints
             };
         }
 
@@ -2148,16 +2218,14 @@ ${titleSecondLine}` : displayTitle;
 ${warningMessage}`;
         }
 
-        const behaviorHints = buildBehaviorHints(stream);
-
         return {
             name: nameDisplay,
             title: finalTitle,
-            url: stream.url,
+            url: delivered.url,
             type: 'url', // CRITICAL: This is the type of the stream itself, not the content
             availability: 2,
-            subtitles: stream.subtitles || [],
-            behaviorHints: behaviorHints
+            subtitles: delivered.subtitles,
+            behaviorHints: delivered.behaviorHints
         };
     });
 
